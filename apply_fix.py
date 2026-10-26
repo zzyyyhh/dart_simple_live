@@ -26,6 +26,14 @@ Simple Live 斗鱼卡顿 / 误判"未开播" 自动补丁
 import sys
 import pathlib
 
+# Windows runner 的控制台不一定是 UTF-8，直接 print 中文会抛 UnicodeEncodeError，
+# 表现成“脚本什么都没干就 exit 1”。这里强制切到 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # 待替换内容（旧文本 -> 新文本）
 # ---------------------------------------------------------------------------
@@ -569,48 +577,76 @@ MARKERS = [
 ]
 
 
+def _read_source(path: pathlib.Path):
+    """读文件：统一成 LF 匹配，同时记住原始换行符和 BOM。"""
+    raw = path.read_bytes()
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    text = raw.decode("utf-8-sig")
+    newline = "\r\n" if "\r\n" in text else "\n"
+    return text.replace("\r\n", "\n"), newline, bom
+
+
+def _write_source(path: pathlib.Path, text: str, newline: str, bom: bool) -> None:
+    data = text.replace("\n", newline).encode("utf-8")
+    if bom:
+        data = b"\xef\xbb\xbf" + data
+    path.write_bytes(data)
+
+
+def _rstrip_lines(s: str) -> str:
+    """逐行去掉行尾空白，用来兼容编辑器/检出带来的差异。"""
+    return "\n".join(line.rstrip() for line in s.split("\n"))
+
+
 def main() -> int:
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
-    lc = root / LC
-    if not lc.exists():
-        print(f"[!] 找不到 {lc}")
-        print("    请在仓库根目录运行（包含 simple_live_app 目录的那一层）")
+    if not (root / LC).exists():
+        print(f"[!] 找不到 {root / LC}")
+        print("    请在仓库根目录运行（就是能看到 simple_live_app 这一层）")
         return 2
 
-    # 先全部校验，再统一写入，避免改一半
-    loaded = {}
-    for name, rel, old, new in PATCHES:
+    files = {}
+    for _, rel, _, _ in PATCHES:
         path = root / rel
-        if path not in loaded:
+        if path not in files:
             try:
-                loaded[path] = path.read_text(encoding="utf-8")
+                files[path] = _read_source(path)
             except OSError as exc:
                 print(f"[!] 读取 {rel} 失败：{exc}")
                 return 2
-        count = loaded[path].count(old)
-        if count != 1:
-            print(f"[!] 锚点未匹配：{name}")
-            print(f"    文件：{rel}")
-            print(f"    期望出现 1 次，实际 {count} 次")
-            print("    第一行是： " + old.splitlines()[0])
-            print("    说明源码版本与补丁不一致，请按 README.md 手工修改这一处。")
-            return 1
 
     for name, rel, old, new in PATCHES:
         path = root / rel
-        loaded[path] = loaded[path].replace(old, new, 1)
-        print(f"[+] {name}")
+        text, newline, bom = files[path]
+        if text.count(old) == 1:
+            text = text.replace(old, new, 1)
+            print(f"[+] {name}")
+        elif _rstrip_lines(text).count(_rstrip_lines(old)) == 1:
+            text = _rstrip_lines(text).replace(_rstrip_lines(old), new, 1)
+            print(f"[+] {name}（已忽略行尾空白差异）")
+        else:
+            print(f"[!] 锚点未匹配：{name}")
+            print(f"    文件：{rel}")
+            print(f"    期望出现 1 次，实际 {text.count(old)} 次")
+            first = old.splitlines()[0]
+            print(f"    锚点首行：{first!r}")
+            print(f"    该行在文件中出现 {text.count(first)} 次")
+            print("    可能是源码版本已变化，把这段日志发给维护者即可。")
+            return 1
+        files[path] = (text, newline, bom)
 
-    for path, text in loaded.items():
-        path.write_text(text, encoding="utf-8")
+    for path, (text, newline, bom) in files.items():
+        _write_source(path, text, newline, bom)
         print(f"[=] 已写入 {path.relative_to(root)}")
 
     for rel, marker in MARKERS:
-        if marker not in (root / rel).read_text(encoding="utf-8"):
+        text, _, _ = files[root / rel]
+        if marker not in text:
             print(f"[!] 校验失败：{rel} 里没有 {marker!r}")
             return 3
 
-    print("\n完成。接下来：")
+    print("")
+    print("完成。接下来：")
     print("  cd simple_live_app")
     print("  flutter pub get")
     print("  flutter build windows --release")
